@@ -20,6 +20,8 @@ This repo holds the CFN template to deploy the EBS KMS key Rotation solution
 4. Choose the **Permissions tab**.
 5. Choose **Add permissions** and then choose **Create inline policy**.
 6. In the **JSON editor** copy and paste the below policy:
+
+```json
    {
     "Version": "2012-10-17",
     "Statement": [
