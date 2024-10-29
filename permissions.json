@@ -1,0 +1,42 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "VisualEditor0",
+            "Effect": "Allow",
+            "Action": [
+                "lambda:CreateFunction",
+                "lambda:GetFunction",
+                "logs:DeleteLogGroup",
+                "lambda:DeleteFunction",
+                "logs:PutRetentionPolicy",
+                "logs:CreateLogGroup",
+                "states:DescribeStateMachine",
+                "lambda:UpdateFunctionCode"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "VisualEditor1",
+            "Effect": "Allow",
+            "Action": [
+                "iam:PassRole",
+                "iam:DeleteRolePolicy",
+                "states:DeleteStateMachine",
+                "iam:CreateRole",
+                "iam:DeleteRole",
+                "iam:PutRolePolicy",
+                "iam:GetRole",
+                "iam:GetRolePolicy",
+                "states:CreateStateMachine",
+                "states:TagResource",
+                "states:UpdateStateMachine"
+            ],
+            "Resource": [
+                "arn:aws:states:*:*:stateMachine:EBSKMSKeyRotationStateMachine*",
+                "arn:aws:iam::*:role/EBSKMSKeyRotationStateMachineRole*",
+                "arn:aws:iam::*:role/EBSKMSKeyRotationLambdaRole*"
+            ]
+        }
+    ]
+}
