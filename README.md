@@ -64,7 +64,7 @@ This repo holds the CFN template to deploy the EBS KMS key Rotation solution
         }
     ]
 }
-
+```
 
 
 # Step 2: Create CloudFormation Stack to deploy the solution.
