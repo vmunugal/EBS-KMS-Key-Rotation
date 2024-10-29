@@ -1,9 +1,8 @@
 # EBS-KMS-Key-Rotation
 This repo holds the CFN template to deploy the EBS KMS key Rotation solution
 
-# Steps to deploy the solution:
-
-# Step 1: Create IAM Role for CloudFormation
+# Deployment steps
+# Step 1: Create an IAM Role for CloudFormation
 1. Sign in to the **AWS Management Console** and open the IAM console at https://console.aws.amazon.com/iam/.
 2. In the navigation pane of the IAM console, choose **Roles**, and then choose **Create role**.
 3. For **Trusted entity type**, choose **AWS service**.
