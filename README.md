@@ -11,4 +11,5 @@ This repo holds the CFN template to deploy the EBS KMS key Rotation solution
 7. On the **Specify stack details** page, type a stack name in the **Stack name** box.
 8. In the **Parameters** section, specify values for the parameters that were defined in the template.
     >> **RetentionInDays** - This parameter is defined as 14 days, modify this with the allowed values from drop down to set                                 desired retention for CloudWatch log groups.
+
     >> **LambdaTimeout** - This Parameter defines the timeout for lambda function in seconds, it is suggested to not to modify                             this parameter.
