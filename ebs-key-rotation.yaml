@@ -1,0 +1,1907 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  RetentionInDays:
+    Description: CloudWatch Log group Retention in DAYS for all the log groups
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+  
+  LambdaTimeout:
+    Description: Lambda timeout in SECONDS
+    Type: Number
+    Default: 90
+    MinValue: 60
+    MaxValue: 900
+
+Resources:
+  # Lambda IAM Roles with limited permissions
+  EBSKMSKeyRotationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub EBSKMSKeyRotationLambdaRole_${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Permissions for logging to CloudWatch
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*" 
+              # Permissions for EC2 API calls
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                  - ec2:DescribeVolumes
+                  - ec2:StopInstances
+                  - ec2:DetachVolume
+                  - ec2:CreateSnapshot
+                  - ec2:CopySnapshot
+                  - ec2:CreateVolume
+                  - ec2:DescribeSnapshots
+                  - ec2:AttachVolume
+                  - ec2:StartInstances
+                  - ec2:DeleteVolume
+                  - ec2:DeleteSnapshot
+                Resource: "*"
+              
+              # Permissions for SSM to preserev the original state of Instance
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:*:${AWS::AccountId}:parameter/i-*"
+
+              # Permissions for KMS 
+              - Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:GenerateDataKey*
+                  - kms:ReEncrypt*
+                  - kms:CreateGrant
+                Resource: "*"
+
+  # Lambda IAM Roles with limited permissions
+  EBSKMSKeyRotationStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub EBSKMSKeyRotationStateMachineRole_${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokePolicyForStateMachine
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Permissions for logging to CloudWatch
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: 
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ValidateInput}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FetchVolumesEncryptedWithOldKey}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${PreserveInputToSSM}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StopInstance}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FetchInstanceState}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DetachVolumes}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FetchVolumeState}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CreateSnapshot}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FetchSnapshotState}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CopySnapshot}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FetchCopiedSnapshotState}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CreateNewVolume}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FetchNewVolumeStatus}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AttachNewVolToInstance}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StartInstances}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ValidateIfInstanceRunning}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CleanupResources}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RollbackDetachVolumes}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RollbackCreateSnapshot}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RollbackCopySnapshot}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RollbackCreateVolume}:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RollbackAttchVolume}:*
+              
+  # Lambda function 0
+  ValidateInput:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ValidateInput
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              valid_input=[]
+              for input in event:
+                  instance_id = input['instance_id']
+                  kms_key_arn = input['kms_key_arn']
+                  new_kms_key_arn = input['new_kms_key_arn']
+                  region = input['region']
+                  region_response = is_valid_region(region)
+                  if region_response:
+                      print(f"validation successful for region: {region}")
+                      instance_response = is_valid_instance_id(instance_id,region)
+                      if instance_response:
+                          print(f"validation successful for instanceID: {instance_id}")
+                      old_kms_response = is_valid_kms_arn(kms_key_arn,region)
+                      if old_kms_response:
+                          print(f"validation successful for KMS key: {kms_key_arn}")
+                      new_kms_response = is_valid_kms_arn(new_kms_key_arn,region)
+                      if new_kms_response:
+                          print(f"validation successful for KMS key: {new_kms_key_arn}")
+                      if instance_response and old_kms_response and new_kms_response:
+                          print(f"validation successful for input: {input}")
+                          valid_input.append(input)
+                      else:
+                          print(f"WARNING: validation FAILED for input: {input}, Skipping the input from processing")
+              return valid_input
+
+          def is_valid_instance_id(instance_id,region):
+              ec2_instance = boto3.client('ec2',region_name=region)
+              try:
+                  instance_details = ec2_instance.describe_instances(InstanceIds=[instance_id])
+                  if instance_details:
+                      return True
+              except Exception as e:
+                  print(f"ERROR:not a Valid input for InstanceID: {instance_id}")
+                  return False
+
+          def is_valid_kms_arn(arn,region):
+              kms = boto3.client('kms',region_name=region)
+              try:
+                  kms_details = kms.describe_key(KeyId=arn)
+                  if kms_details:
+                      return True
+              except Exception as e:
+                  print(f"ERROR:not a Valid input for KMS key ARN: {arn}")
+                  return False
+                  
+          def is_valid_region(region):
+              ec2 = boto3.client('ec2')
+              regions = ec2.describe_regions()
+              for region_detail in regions['Regions']:
+                  if (region_detail['RegionName'] == region):
+                      return True
+            
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+
+  # Lambda function 1
+  FetchVolumesEncryptedWithOldKey:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FetchVolumesEncryptedWithOldKey
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          def lambda_handler(event, context):
+              instance_id = event['instance_id']
+              kms_key_arn = event['kms_key_arn']
+              new_kms_key_arn = event['new_kms_key_arn']
+              region = event['region']
+              ec2 = boto3.client('ec2', region_name=region)
+
+              # Describe instances to get the associated volumes
+              response = ec2.describe_instances(InstanceIds=[instance_id])
+
+              # Extract the block device mappings (volumes attached to the instance)
+              volumes = []
+              for reservation in response['Reservations']:
+                  for instance in reservation['Instances']:
+                      for block_device in instance['BlockDeviceMappings']:
+                          volume_id = block_device['Ebs']['VolumeId']
+                          device_name = block_device['DeviceName']
+                          volumes.append({'volume_id': volume_id, 'device_name': device_name})
+
+              # For each volume, check if it is encrypted with the given KMS key
+              matched_volumes = {}
+              output = {}
+              for volume in volumes:
+                  volume_id = volume['volume_id']
+                  device_name = volume['device_name']                  
+                  # Describe the volume to get encryption details
+                  volume_response = ec2.describe_volumes(VolumeIds=[volume_id])
+                  for vol in volume_response['Volumes']:
+                      if vol['Encrypted'] and vol.get('KmsKeyId') == kms_key_arn:
+                          # If the volume is encrypted with the given KMS key, add it to the dictionary
+                          matched_volumes[volume_id] = device_name
+              if matched_volumes:
+                  output[instance_id] = matched_volumes
+                  output['new_kms_key_arn'] = new_kms_key_arn
+                  output['region'] = region
+                  output['status'] = 'not-empty'
+                  return output
+              else:
+                  output['status'] = 'empty'
+                  return output
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+
+  # Lambda function 2
+
+  PreserveInputToSSM:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: PreserveInputToSSM
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              region = event['region']
+              ssm = boto3.client('ssm',region_name=region)
+              volumes = []
+              instance_ids = event.keys()
+              for instanceid in instance_ids:
+                  if(instanceid != 'new_kms_key_arn' and instanceid != 'status' and instanceid != 'region'):
+                      for volume in event[instanceid]:
+                          print(f'volume is {volume} and device is {event[instanceid][volume]}')
+                          
+                          volumes.append(volume+":"+event[instanceid][volume])
+                      
+                      response = ssm.put_parameter(Name=instanceid,
+                                      Description='Preserving the original instnace state',
+                                      Value=','.join(volumes),
+                                      Type='StringList',
+                                      Overwrite=True,
+                                      Tier='Standard',
+                                      DataType='text'
+                                  )
+              return event
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+
+  # Lambda function 3
+
+  StopInstance:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: StopInstance
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              region = event['region']
+              ec2 = boto3.client('ec2', region_name=region)
+              instance_ids = event.keys()
+              output = {}
+              for instance_id in instance_ids:
+                  if(instance_id != 'status' and instance_id != 'new_kms_key_arn' and instance_id != 'region'):
+                  # encrypted_volumes = event[instance_id]
+                  # Stop the instance
+                      print(f"Stopping instance: {instance_id}")
+                      ec2.stop_instances(InstanceIds=[instance_id])
+                      output[instance_id]=event[instance_id]
+                      output['new_kms_key_arn']=event['new_kms_key_arn']
+                      output['region']=region
+              return output
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout 
+
+  # Lambda function 4
+
+  FetchInstanceState:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FetchInstanceState
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              region=event['region']
+              ec2 = boto3.client('ec2', region_name=region)
+              instance_ids = event.keys()
+              for instance_id in instance_ids:
+                  if(instance_id != 'new_kms_key_arn' and instance_id != 'region'):
+                      response = ec2.describe_instances(InstanceIds=[instance_id])
+                      output = {}
+                      for reservation in response['Reservations']:
+                          for instance in reservation['Instances']:
+                              output['status']=instance['State']
+                              output['input']=event
+                              return output
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout 
+
+  # Lambda function 5
+
+  DetachVolumes:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DetachVolumes
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              region=event['region']
+              ec2 = boto3.client('ec2', region_name=region)
+              instance_ids = event.keys()
+              output={}
+              volume_status_list = []
+              for instance_id in instance_ids:
+                  if(instance_id != 'new_kms_key_arn' and instance_id != 'region'):
+                      encrypted_volumes = event[instance_id]
+                      print(f"Detaching volumes of instance {instance_id}..")
+                      try:   
+                        for volumeid in encrypted_volumes.keys():
+                            ec2.detach_volume(
+                                Device=encrypted_volumes[volumeid],
+                                InstanceId=instance_id,
+                                VolumeId=volumeid
+                            )
+                            response = ec2.describe_volumes(VolumeIds=[volumeid])
+                            for volume in response['Volumes']:
+                                device = encrypted_volumes[volumeid]
+                                volume_status = {'status': region + ";" + volumeid + ";"  + device + ";" + instance_id + ";" + event['new_kms_key_arn'] + ";" + volume['State'] }
+                                volume_status_list.append(volume_status)
+                        # output['input'] =event
+                        output['volume_status']=volume_status_list
+                        return output
+                      except Exception as e:
+                        raise e
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout 
+
+  # Lambda function 6
+  FetchVolumeState:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FetchVolumeState
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              status_value = event['status']
+              region, volume_id, device, instance_id,new_kms_key_arn, old_snaphot_state = status_value.split(';')
+              ec2 = boto3.client('ec2', region_name=region)
+              response = ec2.describe_volumes(VolumeIds=[volume_id])
+              volume_status_list = []
+              output = {}
+              for volume in response['Volumes']:
+                  volume_status = {'status': region + ";" + volume_id + ";" + device + ";" + instance_id + ";" + new_kms_key_arn + ";" + old_snaphot_state}
+              output['volume_status'] = volume_status
+              output['status'] = volume['State']
+              return output
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Lambda function 7
+  CreateSnapshot:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateSnapshot
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              status_info = event['volume_status']['status']
+              output = {}
+              region,volume_id,device,instance_id,new_kms_key_arn,current_volume_state = status_info.split(';')
+              try:
+                ec2 = boto3.client('ec2',region_name=region)
+                response=ec2.create_snapshot(
+                  VolumeId=volume_id,
+                  Description=f'snapshot of volume: {volume_id}'
+                  )
+                snap_details = { 'status' : region + ";" + response['SnapshotId'] + ";"  + response['VolumeId'] + ";" + device + ";" + instance_id + ";"+ new_kms_key_arn + ";" + response['State'] }
+                output['snap_status'] = snap_details
+                return output
+              except Exception as e:
+                raise e
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Lambda function 8
+  FetchSnapshotState:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FetchSnapshotState
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              output = {}
+              snap_details_list = []
+              snap_info = event['status']
+              region,snap_id,volume_id,device,instance_id,new_kms_key_arn,old_snap_status = snap_info.split(";")
+              ec2 = boto3.client('ec2', region_name=region)
+              response = ec2.describe_snapshots(SnapshotIds=[snap_id])
+              for snapshot in response['Snapshots']:
+                  snap_status = snapshot['State']
+                  snap_details = { 'status' : region + ";" + snap_id + ";"  + volume_id + ";" + device + ";" + instance_id + ";" + new_kms_key_arn+ ";" + old_snap_status }
+                  output['snap_status'] = snap_details
+                  output['status'] = snap_status
+              return output
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Lambda function 9
+  CopySnapshot:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CopySnapshot
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              output = {}
+              region,snapshot_id,volume_id,device_name,instance_id,new_kms_key_arn,old_snap_status = event['status'].split(";")
+              ec2 = boto3.client('ec2', region_name=region)
+              volume_response = ec2.describe_volumes(VolumeIds=[volume_id])
+              for volume in volume_response['Volumes']:
+                  volume_az = volume['AvailabilityZone']
+                  volume_region = volume_az[:-1]
+              try:
+                response = ec2.copy_snapshot(
+                                Description=f'copy of snapshot {snapshot_id}',
+                                Encrypted=True,
+                                KmsKeyId=new_kms_key_arn,
+                                SourceRegion=volume_region,
+                                SourceSnapshotId=snapshot_id)   
+                snap_details = { 'status' : region + ";" + response['SnapshotId'] + ";" + snapshot_id + ";" + volume_id + ";" + device_name + ";" + instance_id + ";"+ new_kms_key_arn + ";" + volume_az + ";" + old_snap_status }
+                output['snap_details']=snap_details
+                return output
+              except Exception as e:
+                raise e
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Lambda function 10
+  FetchCopiedSnapshotState:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FetchCopiedSnapshotState
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              output = {}   
+              region,new_snapshot_id,old_snapshot_id,volume_id,device_name,instance_id,new_kms_key_arn, volume_az, old_snapshot_status = event['status'].split(";")
+              ec2 = boto3.client('ec2', region_name=region)
+              response = ec2.describe_snapshots(SnapshotIds=[new_snapshot_id])
+              for snapshot in response['Snapshots']:
+                  new_snapshot_state = snapshot['State']
+              snap_details = { 'status' : region + ";" + new_snapshot_id + ";" + old_snapshot_id + ";" + volume_id + ";" + device_name + ";" + instance_id + ";"+ new_kms_key_arn + ";" + volume_az + ";" + old_snapshot_status }
+              output['snap_details'] = snap_details  
+              output['status'] = new_snapshot_state
+              return output
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Lambda function 11
+  CreateNewVolume:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateNewVolume
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              output = {}
+              input=event
+              region,new_snapshot_id,old_snapshot_id,volume_id,device_name,instance_id,new_kms_key_arn, volume_az, old_snapshot_status = event['status'].split(";")
+              ec2 = boto3.client('ec2', region_name=region)
+              try:
+                response = ec2.create_volume(AvailabilityZone=volume_az,SnapshotId=new_snapshot_id)
+                new_volume_id =response['VolumeId']
+                volume_details = { 'status' : region + ";" + new_volume_id + ";" + new_snapshot_id + ";" + old_snapshot_id + ";" + volume_id + ";" + device_name + ";" + instance_id + ";"+ new_kms_key_arn + ";" + volume_az + ";" + old_snapshot_status }
+                output['volume_details'] = volume_details
+                return output
+              except Exception as e:
+                raise e
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Lambda function 12
+  FetchNewVolumeStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FetchNewVolumeStatus
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              output = {}
+              region,new_volume_id,new_snapshot_id,old_snapshot_id,volume_id,device_name,instance_id,new_kms_key_arn, volume_az, old_snapshot_status = event['status'].split(";")
+              ec2 = boto3.client('ec2', region_name=region)
+              response = ec2.describe_volumes( VolumeIds=[new_volume_id])
+              for volume in response['Volumes']:
+                  new_volume_state = volume['State']
+              volume_details = { 'status' : region + ";" + new_volume_id + ";" + new_snapshot_id + ";" + old_snapshot_id + ";" + volume_id + ";" + device_name + ";" + instance_id + ";"+ new_kms_key_arn + ";" + volume_az + ";" + old_snapshot_status }
+              output['volume_details'] = volume_details
+              output['status'] = new_volume_state
+              return output
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Lambda function 13
+  AttachNewVolToInstance:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AttachNewVolToInstance
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              region,new_volume_id,new_snapshot_id,old_snapshot_id,old_volume_id,device_name,instance_id,new_kms_key_arn, volume_az, old_snapshot_status = event['status'].split(";")
+              try:
+                ec2 = boto3.client('ec2', region_name = region)
+                response = ec2.attach_volume(Device=device_name,InstanceId=instance_id,VolumeId=new_volume_id)
+                return event
+              except Exception as e:
+                raise e
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Lambda function 14
+  StartInstances:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: StartInstances
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              print(f"event is {event}")
+              instance_details=[]
+              for instances in event:
+                  for instance in instances:
+                      if(instance['status'] != "empty"):
+                          region,new_volume_id,new_snapshot_id,old_snapshot_id,old_volume_id,device_name,instance_id,new_kms_key_arn, volume_az, old_snapshot_status = instance['status'].split(";")
+                          ec2 = boto3.client('ec2', region_name = region)
+                          print(f"starting the instance {instance_id}")
+                          response = ec2.start_instances(InstanceIds=[instance_id])
+                          instance_details.append(instance)
+              return instance_details
+
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Lambda function 15
+  ValidateIfInstanceRunning:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ValidateIfInstanceRunning
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+
+          def lambda_handler(event, context):
+              states=[]
+              region,new_volume_id,new_snapshot_id,old_snapshot_id,old_volume_id,device_name,instance_id,new_kms_key_arn, volume_az, old_snapshot_status = event['status'].split(";")
+
+              ec2 = boto3.client('ec2', region_name = region)
+              response = ec2.describe_instances(InstanceIds=[instance_id])
+              output = {}
+              for reservation in response['Reservations']:
+                  for instance in reservation['Instances']:
+                      output['status']=event['status']
+                      output['instance_status']=instance['State']['Name']
+              return output
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Lambda function 16
+  CleanupResources:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CleanupResources
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              
+              detail=event['status']
+              region,new_volume_id,new_snapshot_id,old_snapshot_id,old_volume_id,device_name,instance_id,new_kms_key_arn, volume_az, old_snapshot_status = detail.split(";")
+              ec2 = boto3.client('ec2', region_name = region)
+              old_snap_response = ec2.delete_snapshot(SnapshotId=old_snapshot_id)
+              new_snap_response = ec2.delete_snapshot(SnapshotId=new_snapshot_id)
+              old_volume_response = ec2.delete_volume(VolumeId=old_volume_id)
+              return event
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Rollback Lambda Fnctions 
+  # Rollback Lambda Function 1
+  RollbackDetachVolumes:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RollbackDetachVolumes
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              instance_ids = event.keys()
+              region = event['region']
+              ec2 = boto3.client('ec2',region_name = region)
+              for instance_id in instance_ids:
+                  if(instance_id != 'new_kms_key_arn' and instance_id != 'region'):
+                      volumes = event[instance_id]
+                      instance_info = ec2.describe_instances(InstanceIds=[instance_id])
+                      instance = instance_info['Reservations'][0]['Instances'][0]
+                      instance_state = instance['State']['Name']
+                      attached_volumes = [vol['Ebs']['VolumeId'] for vol in instance['BlockDeviceMappings']]
+                      
+                      # If the instance is stopped, start it
+                      if instance_state == 'stopped':
+                          print(f"Instance {instance_id} is stopped. Starting the instance.")
+                          ec2.start_instances(InstanceIds=[instance_id])
+                          
+                          # Wait for the instance to be in running state
+                          waiter = ec2.get_waiter('instance_running')
+                          waiter.wait(InstanceIds=[instance_id])
+                          print(f"Instance {instance_id} is now running.")
+                      # Check each volume and attach if not already attached
+                      for volume_id, device in volumes.items():
+                          if volume_id not in attached_volumes:
+                              print(f"Attaching volume {volume_id} to instance {instance_id} on device {device}.")
+                              ec2.attach_volume(
+                                  InstanceId=instance_id,
+                                  VolumeId=volume_id,
+                                  Device=device
+                              )
+                              print(f"Volume {volume_id} attached to {device}.")
+                          else:
+                              print(f"Volume {volume_id} is already attached.")         
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Rollback Lambda Function 2
+  RollbackCreateSnapshot:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RollbackCreateSnapshot
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import string
+
+          def lambda_handler(event, context):
+              status_info = event['volume_status']['status']
+              region,volume_id,device_name,instanceid,kms_arn,volume_status = status_info.split(';')
+              ssm = boto3.client('ssm', region_name = region)
+              ec2 = boto3.client('ec2',region_name = region)
+              
+
+              #Fetch the original state of Instance preserved in SSM
+              ssm_response = ssm.get_parameter(Name=instanceid)
+              volumes_info = ssm_response['Parameter']['Value']
+              volumes_list = volumes_info.split(",")
+              
+              #Fetch the current state of Instance
+              instance_info = ec2.describe_instances(InstanceIds=[instanceid])
+              instance = instance_info['Reservations'][0]['Instances'][0]
+              instance_state = instance['State']['Name']
+              attached_volumes = [vol['Ebs']['VolumeId'] for vol in instance['BlockDeviceMappings']]
+
+              # If the instance is stopped, start it
+              if instance_state == 'stopped':
+                  print(f"Instance {instanceid} is stopped. Starting the instance.")
+                  ec2.start_instances(InstanceIds=[instanceid])
+                  
+                  # Wait for the instance to be in running state
+                  waiter = ec2.get_waiter('instance_running')
+                  waiter.wait(InstanceIds=[instanceid])
+                  print(f"Instance {instanceid} is now running.")
+              
+              # Check each volume and attach if not already attached
+              
+              if volume_id not in attached_volumes:
+                  print(f"Attaching volume {volume_id} to instance {instanceid} on device {device_name}.")
+                  ec2.attach_volume(
+                      InstanceId=instanceid,
+                      VolumeId=volume_id,
+                      Device=device_name
+                  )
+                  print(f"Volume {volume_id} attached to {device_name}.")
+              else:
+                  print(f"Volume {volume_id} is already attached.")       
+         
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Rollback Lambda Function 3
+  RollbackCopySnapshot:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RollbackCopySnapshot
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import string
+
+          def lambda_handler(event, context):
+              
+              
+              desired_input = event['status']
+              
+              region,old_snap_id,volume_id,device_name,instanceid,kms_arn,snap_status = desired_input.split(";")
+              ssm = boto3.client('ssm', region_name = region)
+              ec2 = boto3.client('ec2',region_name = region)
+              #Delete the snapshot
+              snap_response = ec2.delete_snapshot(SnapshotId=old_snap_id)
+              print(f'snapshot {old_snap_id} delete initiated ...')
+              
+              #Fetch the original state of Instance preserved in SSM
+              ssm_response = ssm.get_parameter(Name=instanceid)
+              volumes_info = ssm_response['Parameter']['Value']
+              volumes_list = volumes_info.split(",")
+              
+              #Fetch the current state of Instance
+              instance_info = ec2.describe_instances(InstanceIds=[instanceid])
+              instance = instance_info['Reservations'][0]['Instances'][0]
+              instance_state = instance['State']['Name']
+              attached_volumes = [vol['Ebs']['VolumeId'] for vol in instance['BlockDeviceMappings']]
+
+              # If the instance is stopped, start it
+              if instance_state == 'stopped':
+                  print(f"Instance {instanceid} is stopped. Starting the instance.")
+                  ec2.start_instances(InstanceIds=[instanceid])
+                  
+                  # Wait for the instance to be in running state
+                  waiter = ec2.get_waiter('instance_running')
+                  waiter.wait(InstanceIds=[instanceid])
+                  print(f"Instance {instanceid} is now running.")
+              
+              # Check each volume and attach if not already attached
+              
+              if volume_id not in attached_volumes:
+                  print(f"Attaching volume {volume_id} to instance {instanceid} on device {device_name}.")
+                  ec2.attach_volume(
+                      InstanceId=instanceid,
+                      VolumeId=volume_id,
+                      Device=device_name
+                  )
+                  print(f"Volume {volume_id} attached to {device_name}.")
+              else:
+                  print(f"Volume {volume_id} is already attached.")        
+        
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+
+  # Rollback Lambda Function 4
+  RollbackCreateVolume:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RollbackCreateVolume
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import string
+
+          def lambda_handler(event, context):
+              desired_input = event['status']
+              
+              region,new_snap_id,old_snap_id,volume_id,device_name,instanceid,kms_arn,volume_az,snap_status = desired_input.split(";")
+              ssm = boto3.client('ssm', region_name = region)
+              ec2 = boto3.client('ec2',region_name = region)
+              
+              
+              #Delete the snapshots
+              ec2.delete_snapshot(SnapshotId=new_snap_id)
+              print(f'Delete initiated for copied snapshot {new_snap_id}')
+              ec2.delete_snapshot(SnapshotId=old_snap_id)
+              print(f'Delete initiated for old snapshot {old_snap_id}')
+              
+              #Fetch the original state of Instance preserved in SSM
+              ssm_response = ssm.get_parameter(Name=instanceid)
+              volumes_info = ssm_response['Parameter']['Value']
+              volumes_list = volumes_info.split(",")
+              
+              #Fetch the current state of Instance
+              instance_info = ec2.describe_instances(InstanceIds=[instanceid])
+              instance = instance_info['Reservations'][0]['Instances'][0]
+              instance_state = instance['State']['Name']
+              attached_volumes = [vol['Ebs']['VolumeId'] for vol in instance['BlockDeviceMappings']]
+
+              # If the instance is stopped, start it
+              if instance_state == 'stopped':
+                  print(f"Instance {instanceid} is stopped. Starting the instance.")
+                  ec2.start_instances(InstanceIds=[instanceid])
+                  
+                  # Wait for the instance to be in running state
+                  waiter = ec2.get_waiter('instance_running')
+                  waiter.wait(InstanceIds=[instanceid])
+                  print(f"Instance {instanceid} is now running.")
+              
+              # Check each volume and attach if not already attached
+              
+              if volume_id not in attached_volumes:
+                  print(f"Attaching volume {volume_id} to instance {instanceid} on device {device_name}.")
+                  ec2.attach_volume(
+                      InstanceId=instanceid,
+                      VolumeId=volume_id,
+                      Device=device_name
+                  )
+                  print(f"Volume {volume_id} attached to {device_name}.")
+              else:
+                  print(f"Volume {volume_id} is already attached.") 
+ 
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+  
+  # Rollback Lambda Function 5
+  RollbackAttchVolume:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RollbackAttchVolume
+      Handler: index.lambda_handler
+      Role: !GetAtt EBSKMSKeyRotationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import string
+
+          def lambda_handler(event, context):
+              desired_input = event['status']
+              
+              region,new_volume_id,new_snap_id,old_snap_id,volume_id,device_name,instanceid,kms_arn,volume_az,snap_status = desired_input.split(";")
+              ssm = boto3.client('ssm', region_name = region)
+              ec2 = boto3.client('ec2',region_name = region)
+              
+              
+              #Delete the snapshots
+              ec2.delete_snapshot(SnapshotId=new_snap_id)
+              print(f'Delete initiated for copied snapshot {new_snap_id}')
+              ec2.delete_snapshot(SnapshotId=old_snap_id)
+              print(f'Delete initiated for old snapshot {old_snap_id}')
+              
+              #Delete the new volume
+              ec2.delete_volume(VolumeId=new_volume_id)
+              print(f'Delete initiated for the newly created volume: {new_volume_id}')
+              
+              #Fetch the original state of Instance preserved in SSM
+              ssm_response = ssm.get_parameter(Name=instanceid)
+              volumes_info = ssm_response['Parameter']['Value']
+              volumes_list = volumes_info.split(",")
+              
+              #Fetch the current state of Instance
+              instance_info = ec2.describe_instances(InstanceIds=[instanceid])
+              instance = instance_info['Reservations'][0]['Instances'][0]
+              instance_state = instance['State']['Name']
+              attached_volumes = [vol['Ebs']['VolumeId'] for vol in instance['BlockDeviceMappings']]
+
+              # If the instance is stopped, start it
+              if instance_state == 'stopped':
+                  print(f"Instance {instanceid} is stopped. Starting the instance.")
+                  ec2.start_instances(InstanceIds=[instanceid])
+                  
+                  # Wait for the instance to be in running state
+                  waiter = ec2.get_waiter('instance_running')
+                  waiter.wait(InstanceIds=[instanceid])
+                  print(f"Instance {instanceid} is now running.")
+              
+              # Check each volume and attach if not already attached
+              if volume_id not in attached_volumes:
+                  print(f"Attaching volume {volume_id} to instance {instanceid} on device {device_name}.")
+                  ec2.attach_volume(
+                      InstanceId=instanceid,
+                      VolumeId=volume_id,
+                      Device=device_name
+                  )
+                  print(f"Volume {volume_id} attached to {device_name}.")
+              else:
+                  print(f"Volume {volume_id} is already attached.") 
+ 
+      Runtime: python3.8
+      Timeout: !Ref LambdaTimeout
+
+  # CloudWatch Log Group for Lambda Function 0
+  ValidateInputLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${ValidateInput}
+      RetentionInDays:  !Ref RetentionInDays
+
+  # CloudWatch Log Group for Lambda Function 1
+  FetchVolumesEncryptedWithOldKeyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${FetchVolumesEncryptedWithOldKey}
+      RetentionInDays:  !Ref RetentionInDays
+
+  # CloudWatch Log Group for Lambda Function 2
+  PreserveInputToSSMLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${PreserveInputToSSM}
+      RetentionInDays:  !Ref RetentionInDays
+
+  # CloudWatch Log Group for Lambda Function 3
+  StopInstanceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${StopInstance}
+      RetentionInDays:  !Ref RetentionInDays
+
+  # CloudWatch Log Group for Lambda Function 4
+  FetchInstanceStateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${FetchInstanceState}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  # CloudWatch Log Group for Lambda Function 5
+  DetachVolumesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${DetachVolumes}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  # CloudWatch Log Group for Lambda Function 6
+  FetchVolumeStateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${FetchVolumeState}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  # CloudWatch Log Group for Lambda Function 7
+  CreateSnapshotLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${CreateSnapshot}
+      RetentionInDays:  !Ref RetentionInDays
+
+  # CloudWatch Log Group for Lambda Function 8
+  FetchSnapshotStateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${FetchSnapshotState}
+      RetentionInDays:  !Ref RetentionInDays
+
+  # CloudWatch Log Group for Lambda Function 9
+  CopySnapshotLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${CopySnapshot}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  # CloudWatch Log Group for Lambda Function 10
+  FetchCopiedSnapshotStateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${FetchCopiedSnapshotState}
+      RetentionInDays:  !Ref RetentionInDays
+
+  # CloudWatch Log Group for Lambda Function 11
+  CreateNewVolumeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${CreateNewVolume}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  # CloudWatch Log Group for Lambda Function 12
+  FetchNewVolumeStatusLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${FetchNewVolumeStatus}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  # CloudWatch Log Group for Lambda Function 13
+  AttachNewVolToInstanceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${AttachNewVolToInstance}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  # CloudWatch Log Group for Lambda Function 14
+  StartInstancesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${StartInstances}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  # CloudWatch Log Group for Lambda Function 15
+  ValidateIfInstanceRunningLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${ValidateIfInstanceRunning}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  # CloudWatch Log Group for Lambda Function 16
+  CleanupResourcesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${CleanupResources}
+      RetentionInDays:  !Ref RetentionInDays
+
+  # Rollback function log groups
+  # CloudWatch Log Group for Rollback Lambda Function 1
+  RollbackDetachVolumesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${RollbackDetachVolumes}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  # CloudWatch Log Group for Rollback Lambda Function 2
+  RollbackCreateSnapshotLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${RollbackCreateSnapshot}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  # CloudWatch Log Group for Rollback Lambda Function 3
+  RollbackCopySnapshotLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${RollbackCopySnapshot}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  # CloudWatch Log Group for Rollback Lambda Function 4
+  RollbackCreateVolumeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${RollbackCreateVolume}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  # CloudWatch Log Group for Rollback Lambda Function 5
+  RollbackAttchVolumeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/lambda/${RollbackAttchVolume}
+      RetentionInDays:  !Ref RetentionInDays
+  
+  EBSKMSKeyRotationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: EBSKMSKeyRotationStateMachine
+      RoleArn: !GetAtt EBSKMSKeyRotationStateMachineRole.Arn
+      DefinitionString: !Sub |
+          {
+            "Comment": "StateMachine to rotate the KMS key of AWS EBS volumes",
+            "StartAt": "ValidateInput",
+            "States": {
+              "ValidateInput": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ValidateInput}:$LATEST"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "IterateThroughInstances"
+              },
+              "IterateThroughInstances": {
+                "Type": "Map",
+                "ItemProcessor": {
+                  "ProcessorConfig": {
+                    "Mode": "INLINE"
+                  },
+                  "StartAt": "FetchVolumesEncryptedWithOldKey",
+                  "States": {
+                    "FetchVolumesEncryptedWithOldKey": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "OutputPath": "$.Payload",
+                      "Parameters": {
+                        "Payload.$": "$",
+                        "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FetchVolumesEncryptedWithOldKey}:$LATEST"
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 3,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "End": true,
+                      "TimeoutSeconds": 600
+                    }
+                  }
+                },
+                "Next": "InstancesAndEncryptedVolumesDetails"
+              },
+              "InstancesAndEncryptedVolumesDetails": {
+                "Type": "Pass",
+                "Next": "ForEveryInstanceInInput"
+              },
+              "ForEveryInstanceInInput": {
+                "Type": "Map",
+                "ItemProcessor": {
+                  "ProcessorConfig": {
+                    "Mode": "INLINE"
+                  },
+                  "StartAt": "EncryptedVolumesExistsForInstance?",
+                  "States": {
+                    "EncryptedVolumesExistsForInstance?": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                          "Variable": "$.status",
+                          "StringEquals": "not-empty",
+                          "Next": "InstanceHasEncryptedVolumes"
+                        }
+                      ],
+                      "Default": "InstanceHasNoEncryptedVolumes"
+                    },
+                    "InstanceHasEncryptedVolumes": {
+                      "Type": "Pass",
+                      "Next": "PreserveInputToSSM"
+                    },
+                    "PreserveInputToSSM": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "OutputPath": "$.Payload",
+                      "Parameters": {
+                        "Payload.$": "$",
+                        "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${PreserveInputToSSM}:$LATEST"
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 3,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "Next": "StopInstance"
+                    },
+                    "InstanceHasNoEncryptedVolumes": {
+                      "Type": "Pass",
+                      "End": true,
+                      "Result": [
+                        {
+                          "status": "empty"
+                        }
+                      ]
+                    },
+                    "StopInstance": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "OutputPath": "$.Payload",
+                      "Parameters": {
+                        "Payload.$": "$",
+                        "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StopInstance}:$LATEST"
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 3,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "Next": "FetchInstanceState"
+                    },
+                    "FetchInstanceState": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "OutputPath": "$.Payload",
+                      "Parameters": {
+                        "Payload.$": "$",
+                        "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FetchInstanceState}:$LATEST"
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 3,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "Next": "IsInstanceStopped"
+                    },
+                    "IsInstanceStopped": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                          "Variable": "$.status.Name",
+                          "StringEquals": "stopped",
+                          "Next": "DetachVolumes"
+                        }
+                      ],
+                      "Default": "WaitForInstance",
+                      "OutputPath": "$.input"
+                    },
+                    "WaitForInstance": {
+                      "Type": "Wait",
+                      "Seconds": 5,
+                      "Next": "FetchInstanceState"
+                    },
+                    "DetachVolumes": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "Payload.$": "$",
+                        "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DetachVolumes}:$LATEST"
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 3,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "Next": "ForEveryVolumeOfInstance",
+                      "Catch": [
+                        {
+                          "ErrorEquals": [
+                            "States.ALL"
+                          ],
+                          "Comment": "Rollback",
+                          "ResultPath": null,
+                          "Next": "RollbackDetachVolumes"
+                        }
+                      ]
+                    },
+                    "RollbackDetachVolumes": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "Payload.$": "$",
+                        "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RollbackDetachVolumes}:$LATEST"
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 3,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "End": true,
+                      "ResultSelector": [
+                        {
+                          "status": "empty"
+                        }
+                      ]
+                    },
+                    "ForEveryVolumeOfInstance": {
+                      "Type": "Map",
+                      "ItemProcessor": {
+                        "ProcessorConfig": {
+                          "Mode": "INLINE"
+                        },
+                        "StartAt": "FetchVolumeState",
+                        "States": {
+                          "FetchVolumeState": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "Payload.$": "$",
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FetchVolumeState}:$LATEST"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2
+                              }
+                            ],
+                            "Next": "IsVolumeAvailable?",
+                            "OutputPath": "$.Payload"
+                          },
+                          "IsVolumeAvailable?": {
+                            "Type": "Choice",
+                            "Choices": [
+                              {
+                                "Variable": "$.status",
+                                "StringEquals": "available",
+                                "Next": "CreateSnapshot"
+                              }
+                            ],
+                            "Default": "WaitForVolume"
+                          },
+                          "CreateSnapshot": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload.snap_status",
+                            "Parameters": {
+                              "Payload.$": "$",
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CreateSnapshot}:$LATEST"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2
+                              }
+                            ],
+                            "Next": "FetchSnapshotState",
+                            "Catch": [
+                              {
+                                "ErrorEquals": [
+                                  "States.ALL"
+                                ],
+                                "Comment": "Rollback on error",
+                                "Next": "RollbackCreateSnapshot",
+                                "ResultPath": null
+                              }
+                            ]
+                          },
+                          "RollbackCreateSnapshot": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                              "Payload.$": "$",
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RollbackCreateSnapshot}:$LATEST"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2
+                              }
+                            ],
+                            "End": true,
+                            "ResultSelector": [
+                                  {
+                                    "status": "empty"
+                                  }
+                                ]
+                          },
+                          "FetchSnapshotState": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "Payload.$": "$",
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FetchSnapshotState}:$LATEST"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2
+                              }
+                            ],
+                            "Next": "IsSnapshotCompleted",
+                            "OutputPath": "$.Payload"
+                          },
+                          "IsSnapshotCompleted": {
+                            "Type": "Choice",
+                            "Choices": [
+                              {
+                                "Variable": "$.status",
+                                "StringEquals": "completed",
+                                "Next": "CopySnapshot"
+                              }
+                            ],
+                            "Default": "WaitForSnapshot",
+                            "OutputPath": "$.snap_status"
+                          },
+                          "CopySnapshot": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "Payload.$": "$",
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CopySnapshot}:$LATEST"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2
+                              }
+                            ],
+                            "Next": "FetchCopiedSnapshotState",
+                            "OutputPath": "$.Payload.snap_details",
+                            "Catch": [
+                              {
+                                "ErrorEquals": [
+                                  "States.ALL"
+                                ],
+                                "Comment": "Rollback",
+                                "Next": "RollbackCopySnapshot",
+                                "ResultPath": null
+                              }
+                            ]
+                          },
+                          "RollbackCopySnapshot": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "Payload.$": "$",
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RollbackCopySnapshot}:$LATEST"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2
+                              }
+                            ],
+                            "End": true,
+                            "ResultSelector": [
+                              {
+                                "status": "empty"
+                              }
+                            ]
+                          },
+                          "FetchCopiedSnapshotState": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FetchCopiedSnapshotState}:$LATEST",
+                              "Payload.$": "$"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2
+                              }
+                            ],
+                            "Next": "IsCopiedSnapshotCompleted",
+                            "OutputPath": "$.Payload"
+                          },
+                          "IsCopiedSnapshotCompleted": {
+                            "Type": "Choice",
+                            "Choices": [
+                              {
+                                "Variable": "$.status",
+                                "StringEquals": "completed",
+                                "Next": "CreateNewVolume"
+                              }
+                            ],
+                            "Default": "WaitForcopiedSnapshot",
+                            "OutputPath": "$.snap_details"
+                          },
+                          "CreateNewVolume": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload.volume_details",
+                            "Parameters": {
+                              "Payload.$": "$",
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CreateNewVolume}:$LATEST"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2
+                              }
+                            ],
+                            "Next": "FetchNewVolumeStatus",
+                            "Catch": [
+                              {
+                                "ErrorEquals": [
+                                  "States.ALL"
+                                ],
+                                "Comment": "Rollback",
+                                "Next": "RollbackCreateVolume",
+                                "ResultPath": null
+                              }
+                            ]
+                          },
+                          "RollbackCreateVolume": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "Payload.$": "$",
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RollbackCreateVolume}:$LATEST"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2
+                              }
+                            ],
+                            "End": true,
+                            "ResultSelector": [
+                              {
+                                "status": "empty"
+                              }
+                            ]
+                          },
+                          "FetchNewVolumeStatus": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                              "Payload.$": "$",
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FetchNewVolumeStatus}:$LATEST"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2
+                              }
+                            ],
+                            "Next": "IsNewVolumeAvailable?"
+                          },
+                          "IsNewVolumeAvailable?": {
+                            "Type": "Choice",
+                            "Choices": [
+                              {
+                                "Variable": "$.status",
+                                "StringEquals": "available",
+                                "Next": "AttachNewVolToInstance"
+                              }
+                            ],
+                            "Default": "WaitForNewVolume",
+                            "OutputPath": "$.volume_details"
+                          },
+                          "WaitForNewVolume": {
+                            "Type": "Wait",
+                            "Seconds": 5,
+                            "Next": "FetchNewVolumeStatus"
+                          },
+                          "AttachNewVolToInstance": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                              "Payload.$": "$",
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AttachNewVolToInstance}:$LATEST"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2
+                              }
+                            ],
+                            "End": true,
+                            "Catch": [
+                              {
+                                "ErrorEquals": [
+                                  "States.ALL"
+                                ],
+                                "Comment": "Rollback",
+                                "Next": "RollbackAttchVolume",
+                                "ResultPath": null
+                              }
+                            ]
+                          },
+                          "RollbackAttchVolume": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "Payload.$": "$",
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RollbackAttchVolume}:$LATEST"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 2
+                              }
+                            ],
+                            "End": true,
+                            "ResultSelector": [
+                              {
+                                "status": "empty"
+                              }
+                            ]
+                          },
+                          "WaitForcopiedSnapshot": {
+                            "Type": "Wait",
+                            "Seconds": 10,
+                            "Next": "FetchCopiedSnapshotState"
+                          },
+                          "WaitForSnapshot": {
+                            "Type": "Wait",
+                            "Seconds": 10,
+                            "Next": "FetchSnapshotState"
+                          },
+                          "WaitForVolume": {
+                            "Type": "Wait",
+                            "Seconds": 5,
+                            "Next": "FetchVolumeState"
+                          }
+                        }
+                      },
+                      "End": true,
+                      "InputPath": "$.Payload.volume_status"
+                    }
+                  }
+                },
+                "Next": "StartInstances"
+              },
+              "StartInstances": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StartInstances}:$LATEST"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "ForEveryInstance",
+                "Catch": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Comment": "ManualIntervention",
+                    "Next": "ManualInterventionRequired",
+                    "ResultPath": null
+                  }
+                ]
+              },
+              "ForEveryInstance": {
+                "Type": "Map",
+                "ItemProcessor": {
+                  "ProcessorConfig": {
+                    "Mode": "INLINE"
+                  },
+                  "StartAt": "ValidateIfInstanceRunning",
+                  "States": {
+                    "ValidateIfInstanceRunning": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "OutputPath": "$.Payload",
+                      "Parameters": {
+                        "Payload.$": "$",
+                        "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ValidateIfInstanceRunning}:$LATEST"
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 3,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "Next": "IsInstanceStarted"
+                    },
+                    "IsInstanceStarted": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                          "Variable": "$.instance_status",
+                          "StringEquals": "running",
+                          "Next": "CleanupResources"
+                        }
+                      ],
+                      "Default": "WaitForInstanceToStart"
+                    },
+                    "CleanupResources": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "OutputPath": "$.Payload",
+                      "Parameters": {
+                        "Payload.$": "$",
+                        "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CleanupResources}:$LATEST"
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 3,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "End": true
+                    },
+                    "WaitForInstanceToStart": {
+                      "Type": "Wait",
+                      "Seconds": 5,
+                      "Next": "ValidateIfInstanceRunning"
+                    }
+                  }
+                },
+                "End": true
+              },
+              "ManualInterventionRequired": {
+                "Type": "Fail"
+              }
+            }
+          }
