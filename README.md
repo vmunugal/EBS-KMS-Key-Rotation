@@ -1,5 +1,37 @@
-# EBS-KMS-Key-Rotation
-This repo holds the CFN template to deploy the EBS KMS key Rotation solution
+# AWS KMS Key Rotation Solution
+This repository provides an automated solution for rotating KMS keys across AWS services, starting with EBS volume encryption key rotation. The solution is designed to be extensible to support other KMS-integrated AWS services in future releases.
+
+## Solution Overview
+The KMS Key Rotation solution automates the process of rotating encryption keys for AWS resources with minimal downtime. The current implementation focuses on EBS volumes attached to EC2 instances, with plans to extend support to other AWS services that integrate with KMS.
+
+### EBS Volume Key Rotation Process
+The solution performs the following automated steps:
+1. **Input Validation**: Accepts target KMS key and EC2 instance IDs as input parameters
+2. **Instance Management**: Safely stops the target EC2 instance
+3. **Volume Operations**: Detaches all EBS volumes from the instance
+4. **Snapshot Creation**: Creates snapshots of existing volumes for backup
+5. **Encryption Migration**: Copies snapshots to the same region with new KMS key encryption
+6. **Volume Recreation**: Creates new EBS volumes from the re-encrypted snapshots
+7. **Reattachment**: Attaches the new volumes to the EC2 instance
+8. **Instance Restart**: Starts the EC2 instance with updated encryption
+9. **Cleanup**: Removes old volumes and snapshots to optimize costs
+
+### Future Extensibility
+This solution serves as the foundation for a comprehensive KMS key rotation platform that will be extended to support:
+- RDS encrypted databases
+- S3 bucket encryption
+- EFS file systems
+- Lambda environment variables
+- Secrets Manager secrets
+- Parameter Store secure strings
+- And other KMS-integrated AWS services
+
+## Current Features
+- **Zero-data-loss rotation**: Uses snapshot-based approach to ensure data integrity
+- **Cost optimization**: Automatic cleanup of old resources
+- **Minimal downtime**: Optimized process flow to reduce service interruption
+- **Error handling**: Comprehensive error handling and rollback capabilities
+- **Logging**: Detailed CloudWatch logging for audit and troubleshooting
 
 # Deployment steps
 # Step 1: Create an IAM Role for CloudFormation
@@ -66,7 +98,13 @@ This repo holds the CFN template to deploy the EBS KMS key Rotation solution
 ```
 
 
-# Step 2: Create CloudFormation Stack to deploy the solution.
+## Input Parameters
+The solution accepts the following input parameters:
+- **Target KMS Key**: The new KMS key ARN or ID to encrypt volumes with
+- **Instance IDs**: List of EC2 instance IDs whose EBS volumes need key rotation
+- **Retention Settings**: Snapshot retention period for backup purposes
+
+# Step 3: Create CloudFormation Stack to deploy the solution.
 1. Open the AWS CloudFormation console at https://console.aws.amazon.com/cloudformation.
 2. On the navigation bar at the top of the screen, choose the AWS Region to create the stack in.
 3. On the Stacks page, choose Create stack at top right, and then choose With new resources (standard).
